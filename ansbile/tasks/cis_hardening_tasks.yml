@@ -1,0 +1,206 @@
+---
+# ==============================================================================
+# Step 1: Install Mandatory CIS Level 1 & Auditing Packages
+# ==============================================================================
+- name: Update APT cache and install mandatory CIS Level 1 packages
+  ansible.builtin.apt:
+    name: "{{ install_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# ==============================================================================
+# Step 2: Purge Prohibited & Conflicting Packages (Including UFW)
+# ==============================================================================
+- name: Purge prohibited CIS packages and conflicting firewalls
+  ansible.builtin.apt:
+    name: "{{ remove_packages }}"
+    state: absent
+    purge: true
+    autoremove: true
+
+# ==============================================================================
+# Step 3: Configure CIS-Compliant nftables Firewall with Manager SSH Access
+# ==============================================================================
+- name: Deploy CIS-compliant /etc/nftables.conf with manager_ips SSH whitelist
+  ansible.builtin.copy:
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0640"
+    backup: true
+    content: |
+      #!/usr/sbin/nft -f
+
+      flush ruleset
+
+      table inet filter {
+          chain input {
+              type filter hook input priority filter; policy drop;
+
+              # 1. Accept loopback traffic and drop spoofed loopback packets (CIS Requirement)
+              iif "lo" accept
+              iif != "lo" ip saddr 127.0.0.0/8 counter drop
+              iif != "lo" ip6 saddr ::1 counter drop
+
+              # 2. Stateful connection tracking
+              ct state established,related accept
+              ct state invalid counter drop
+
+              # 3. Allow essential ICMP/ICMPv6
+              ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
+              ip6 nexthdr ipv6-icmp accept
+
+              # 4. Allow SSH (port 22) strictly from manager_ips
+      {% for ip in manager_ips %}
+              {{ 'ip6 saddr' if ':' in ip else 'ip saddr' }} {{ ip }} tcp dport 22 ct state new accept
+      {% endfor %}
+
+              # 5. Log and drop all other inbound traffic
+              log prefix "nftables-input-drop: " flags all counter drop
+          }
+
+          chain forward {
+              type filter hook forward priority filter; policy drop;
+          }
+
+          chain output {
+              type filter hook output priority filter; policy accept;
+          }
+      }
+  notify: Reload nftables
+
+- name: Enable and start nftables service
+  ansible.builtin.systemd:
+    name: nftables
+    enabled: true
+    state: started
+
+# ==============================================================================
+# Step 4: Create Security Group & Grant Read-Only Access to All System Logs
+# ==============================================================================
+- name: Ensure non-root log auditor group exists
+  ansible.builtin.group:
+    name: "{{ log_group }}"
+    state: present
+
+- name: Check existing systemd journal directories
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /var/log/journal
+    - /run/log/journal
+  register: journal_dirs
+
+- name: Grant active read/traverse ACLs on systemd journal directories
+  ansible.posix.acl:
+    path: "{{ item.stat.path }}"
+    entity: "{{ log_group }}"
+    etype: group
+    permissions: rx
+    recursive: true
+    state: present
+  loop: "{{ journal_dirs.results }}"
+  when: item.stat.exists
+
+- name: Grant default read/traverse ACLs on systemd journal directories
+  ansible.posix.acl:
+    path: "{{ item.stat.path }}"
+    entity: "{{ log_group }}"
+    etype: group
+    permissions: rx
+    default: true
+    recursive: true
+    state: present
+  loop: "{{ journal_dirs.results }}"
+  when: item.stat.exists
+
+- name: Grant active read-only ACLs across /var/log
+  ansible.posix.acl:
+    path: /var/log
+    entity: "{{ log_group }}"
+    etype: group
+    permissions: rX
+    recursive: true
+    state: present
+
+- name: Grant default read-only ACLs for future files in /var/log
+  ansible.posix.acl:
+    path: /var/log
+    entity: "{{ log_group }}"
+    etype: group
+    permissions: rX
+    default: true
+    recursive: true
+    state: present
+
+- name: Configure rsyslog file creation modes for ACL compatibility
+  ansible.builtin.copy:
+    dest: /etc/rsyslog.d/99-cis-log-permissions.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Allow {{ log_group }} to read newly created rsyslog files via default directory ACLs
+      $FileCreateMode 0640
+      $DirCreateMode 0750
+      $Umask 0022
+  notify: Restart rsyslog
+
+# ==============================================================================
+# Step 5: Configure auditd Access Rights & Log All User Commands (execve)
+# ==============================================================================
+- name: Set log_group in /etc/audit/auditd.conf
+  ansible.builtin.lineinfile:
+    path: /etc/audit/auditd.conf
+    regexp: '^log_group\s*='
+    line: "log_group = {{ log_group }}"
+    state: present
+  notify: Restart auditd
+
+- name: Ensure /var/log/audit directory permissions and group ownership
+  ansible.builtin.file:
+    path: /var/log/audit
+    state: directory
+    owner: root
+    group: "{{ log_group }}"
+    mode: "0750"
+
+- name: Grant active read-only ACLs on /var/log/audit
+  ansible.posix.acl:
+    path: /var/log/audit
+    entity: "{{ log_group }}"
+    etype: group
+    permissions: rX
+    recursive: true
+    state: present
+
+- name: Grant default read-only ACLs on /var/log/audit
+  ansible.posix.acl:
+    path: /var/log/audit
+    entity: "{{ log_group }}"
+    etype: group
+    permissions: rX
+    default: true
+    recursive: true
+    state: present
+
+- name: Add auditd rules to log all executed commands (execve) for all users
+  ansible.builtin.copy:
+    dest: /etc/audit/rules.d/99-command-logging.rules
+    owner: root
+    group: root
+    mode: "0640"
+    content: |
+      # Log all executed commands (execve) across 64-bit and 32-bit architectures
+      -a always,exit -F arch=b64 -S execve -k user_commands
+      -a always,exit -F arch=b32 -S execve -k user_commands
+  notify:
+    - Load auditd rules
+    - Restart auditd
+
+- name: Enable auditd service
+  ansible.builtin.systemd:
+    name: auditd
+    enabled: true
+    state: started
